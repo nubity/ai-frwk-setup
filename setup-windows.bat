@@ -8,18 +8,61 @@
 :: the setup from their Linux terminal instead. Otherwise, it runs
 :: natively on Windows Python.
 ::
+:: Commercial roles (double-click from an OneDrive-synced project directory
+:: whose name carries the 19-digit CRM ID) skip the WSL probe entirely -
+:: they never use WSL and the probe otherwise incurs a slow WSL2 VM
+:: cold-start before any CRM ID work begins.
+::
 :: Prerequisite: Python 3.11+ in PATH (Windows or WSL).
 ::
+
+:: Ensure CWD is the directory where this script lives.
+cd /d "%~dp0"
 
 echo.
 echo   AI Framework - Workspace Setup
 echo   ================================
 echo.
 
-:: Check if WSL is available with a working distro.
+:: Verify python is available (needed for CRM detection, download, and the
+:: bootstrap itself). Check it once here so both paths can rely on it.
+python --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo   [!!] Python not found in PATH.
+    echo   [!!] Install Python 3.11+ and ensure it is added to PATH.
+    goto :done
+)
+
+:: Commercial mode: this launcher lives inside an OneDrive-synced project
+:: directory whose name carries the 19-digit CRM ID. Commercial roles
+:: (Account Manager, Pre-sales, PO) do NOT use WSL, so skip the WSL probe
+:: entirely for them - it triggers a slow WSL2 VM cold-start (several
+:: seconds, sometimes a hang when a distro is installing or absent) with
+:: no benefit. Detection reuses bootstrap.py's exact rule (a token of
+:: EXACTLY 19 digits bounded by word boundaries) so the two agree.
+call :detect_crm_id
+if defined CRM_IN_DIR goto :windows_path
+
+:: Delivery mode: probe for a working WSL distro (technical roles run the
+:: setup from Linux). The probe can be slow on first invocation, so show a
+:: line of feedback instead of a silent pause.
+echo   Checking environment...
 wsl -- echo ok >nul 2>&1
 if %errorlevel% equ 0 goto :wsl_path
 goto :windows_path
+
+:: -----------------------------------------------------------------
+:detect_crm_id
+:: Sets CRM_IN_DIR when the current directory name contains a token of
+:: exactly 19 digits, matching bootstrap.py's CRM_ID_PATTERN = \b(\d{19})\b.
+:: findstr cannot express word boundaries or an exact-count quantifier, so
+:: the check is delegated to a one-line Python invocation using the same
+:: regex. os.path.basename(os.getcwd()) is the folder name the launcher was
+:: double-clicked from (CWD was set to the script's own directory above).
+:: -----------------------------------------------------------------
+set "CRM_IN_DIR="
+for /f %%R in ('python -c "import os,re,sys; sys.stdout.write('1' if re.search(r'\b\d{19}\b', os.path.basename(os.getcwd())) else '')" 2^>nul') do set "CRM_IN_DIR=%%R"
+goto :eof
 
 :: -----------------------------------------------------------------
 :wsl_path
@@ -49,13 +92,7 @@ goto :done
 :: -----------------------------------------------------------------
 :windows_path
 :: -----------------------------------------------------------------
-:: Verify python is available.
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo   [!!] Python not found in PATH.
-    echo   [!!] Install Python 3.11+ and ensure it is added to PATH.
-    goto :done
-)
+:: Python was already verified up-front, before WSL/commercial detection.
 
 :: Write a small download helper to a temp file (avoids CMD quoting issues).
 echo   Downloading bootstrap script...

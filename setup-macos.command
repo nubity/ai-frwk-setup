@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# Ensure CWD is the directory where this script lives.
+# Required for commercial mode detection (bootstrap.py infers CRM ID from CWD name).
+cd "$(dirname "$0")"
+
 echo ""
 echo "  AI Framework - Workspace Setup"
 echo "  ================================"
