@@ -3,13 +3,18 @@
 AI Framework - Workspace Bootstrap Script
 
 Single-file, zero-dependency Python script that initializes a new AI Framework
-project workspace. Supports two invocation modes:
+project workspace. Supports three invocation modes:
 
   CLI mode (terminal with arguments):
     python3 bootstrap.py <CRM_ID> [OPTIONS]
 
   Interactive mode (double-click or no arguments):
     Prompts the user for all required values via input().
+
+  Commercial mode (double-click from OneDrive-synced directory):
+    Detected automatically when CWD is an OneDrive-synced directory with a
+    CRM ID in its name and no .git/ present. Installs the framework to
+    $HOME/.kiro/ instead of inside the workspace.
 
 One-liner examples:
 
@@ -24,6 +29,7 @@ Exit codes:
   1   Missing prerequisites or invalid arguments
   2   Git clone failed
   3   setup-workspace.py failed
+  4   Commercial setup failed
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ import atexit
 import functools
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -44,7 +51,8 @@ from pathlib import Path
 AIFRWK_REPO_SSH = 'git@github.com:nubity/ai-frwk.git'
 AIFRWK_REPO_HTTPS = 'https://github.com/nubity/ai-frwk.git'
 CLONE_DIR_NAME = 'ai-frwk-setup'
-VERSION = '1.0.0'
+VERSION = '1.1.0'
+CRM_ID_PATTERN = re.compile(r'\b(\d{19})\b')
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -325,7 +333,14 @@ def _gather_interactive() -> dict:
     """Gather all parameters via interactive prompts."""
     print()
 
-    crm_id = _prompt('CRM ID (19 digits)', validator=_validate_crm_id)
+    # Auto-detect CRM ID from CWD (commercial mode: OneDrive directory).
+    cwd_name = Path.cwd().name
+    match = CRM_ID_PATTERN.search(cwd_name)
+    default_crm = match.group(1) if match else ''
+
+    crm_id = _prompt(
+        'CRM ID (19 digits)', default=default_crm, validator=_validate_crm_id,
+    )
 
     return {
         'crm_id': crm_id,
@@ -429,22 +444,259 @@ def _show_logo() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Commercial mode detection and setup
+# ---------------------------------------------------------------------------
+
+
+def _detect_commercial_mode(config: dict) -> tuple[bool, str]:
+    """
+    Determine if the bootstrap was invoked from a commercial workspace.
+
+    Commercial mode is detected when ALL conditions hold:
+    1. No CRM ID was explicitly passed as a positional argument.
+    2. The current working directory name matches the OneDrive-synced directory
+       naming convention: "Nubity Document Site - <19-digit CRM ID>".
+    3. No local .kiro/config.json exists (delivery workspaces always have this
+       after setup; its presence is the canonical delivery signal).
+
+    Note: .git/ is NOT used as a disqualifier because old commercial setups
+    may have a stale .git/ from the framework clone that previously lived
+    inside the OneDrive directory.
+
+    :param config: Parsed CLI arguments or interactive config dict.
+    :return: Tuple of (is_commercial, crm_id). crm_id is empty when not commercial.
+    """
+    if config['crm_id']:
+        return False, ''
+
+    cwd = Path.cwd()
+
+    # Primary signal: directory name matches OneDrive convention.
+    if not cwd.name.startswith('Nubity Document Site - '):
+        return False, ''
+
+    # Extract CRM ID from directory name.
+    match = CRM_ID_PATTERN.search(cwd.name)
+    if not match:
+        return False, ''
+
+    # Delivery exclusion: local .kiro/config.json means this is a canonical
+    # delivery workspace that was set up on top of the OneDrive directory.
+    if (cwd / '.kiro' / 'config.json').is_file():
+        return False, ''
+
+    return True, match.group(1)
+
+
+def _commercial_setup(crm_id: str, branch: str, use_https: bool) -> None:
+    """
+    Execute the commercial workspace setup: install framework to $HOME/.kiro/.
+
+    Steps:
+    1. Clone ai-frwk into $HOME/.kiro/.git-source/ (shallow, single branch).
+    2. Copy framework contents from the clone into $HOME/.kiro/.
+    3. Delegate to setup-workspace.py --commercial for role resolution, config
+       writing, directory creation, and Kiro IDE launch.
+
+    :param crm_id: The 19-digit CRM ID extracted from the workspace path.
+    :param branch: ai-frwk branch to clone.
+    :param use_https: Whether to use HTTPS for cloning (vs SSH).
+    """
+    _step('Commercial mode - Installing to $HOME/.kiro/')
+
+    home_kiro = Path.home() / '.kiro'
+    git_source = home_kiro / '.git-source'
+    workspace_root = Path.cwd()
+
+    _info(f'Workspace: {workspace_root}')
+    _info(f'Framework: {home_kiro}')
+    _info(f'CRM ID:    {crm_id}')
+    print()
+
+    # --- Clone or update .git-source/ ----------------------------------------
+    repo_url = _resolve_repo_url(use_https)
+
+    if (git_source / '.git').is_dir():
+        _info('Updating existing .git-source/...')
+        result = subprocess.run(
+            ['git', 'fetch', '--quiet', '--depth=1', 'origin', branch],
+            capture_output=True, text=True, cwd=str(git_source),
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
+            timeout=30,
+        )
+        if result.returncode != 0:
+            _error(f'git fetch failed: {result.stderr.strip()}')
+            sys.exit(2)
+        subprocess.run(
+            ['git', 'reset', '--quiet', '--hard', 'FETCH_HEAD'],
+            capture_output=True, text=True, cwd=str(git_source),
+        )
+        _ok('Updated .git-source/')
+    else:
+        _info('Cloning ai-frwk...')
+        home_kiro.mkdir(parents=True, exist_ok=True)
+        clone_cmd = [
+            'git', 'clone', '--depth=1', '--branch', branch,
+            repo_url, str(git_source),
+        ]
+        result = subprocess.run(
+            clone_cmd, capture_output=True, text=True,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
+            timeout=60,
+        )
+        if result.returncode != 0:
+            _error(f'git clone failed: {result.stderr.strip()}')
+            if not use_https:
+                _info('Tip: If SSH keys are not configured, re-run with --https.')
+            sys.exit(2)
+        _ok('Cloned ai-frwk')
+
+    # --- Copy framework contents to $HOME/.kiro/ -----------------------------
+    _step('Copying framework contents')
+
+    source_kiro = git_source / '.kiro'
+    if not source_kiro.is_dir():
+        _error('.kiro/ directory not found in cloned repository.')
+        sys.exit(4)
+
+    # Directories to copy from the source .kiro/ into $HOME/.kiro/.
+    sync_dirs = [
+        'steering', 'scripts', 'skills', 'hooks', 'agents',
+        'role-workflows', 'powers', 'templates',
+    ]
+    # Files to copy at the root of .kiro/.
+    sync_files = ['policies.json']
+
+    for dirname in sync_dirs:
+        src = source_kiro / dirname
+        dst = home_kiro / dirname
+        if src.is_dir():
+            if dst.is_dir():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+
+    for filename in sync_files:
+        src = source_kiro / filename
+        dst = home_kiro / filename
+        if src.is_file():
+            shutil.copy2(src, dst)
+
+    _ok('Framework contents installed')
+
+    # --- Patch paths for commercial layout -----------------------------------
+    # The copied files reference .kiro/ (relative to workspace root). In
+    # commercial layout, .kiro/ lives at $HOME — paths must be rewritten.
+    # Also adapts python3 -> python on Windows.
+    scripts_dir = home_kiro / 'scripts'
+    if scripts_dir.is_dir():
+        sys.path.insert(0, str(scripts_dir))
+        try:
+            from _sync_utils import patchCommercialLayout, patchPythonCommand
+            patchPythonCommand(home_kiro)
+            patchCommercialLayout(home_kiro)
+            _ok('Paths adapted for commercial layout')
+        except Exception as exc:
+            _warn(f'Path patching failed: {exc}')
+        finally:
+            sys.path.pop(0)
+
+    # --- Delegate to setup-workspace.py --------------------------------------
+    _step('Running setup-workspace.py --commercial')
+
+    setup_script = home_kiro / 'scripts' / 'setup-workspace.py'
+    if not setup_script.is_file():
+        _error(f'Setup script not found: {setup_script}')
+        sys.exit(4)
+
+    setup_cmd = [sys.executable, str(setup_script), '--commercial', '--branch', branch]
+
+    proc = subprocess.run(setup_cmd, cwd=str(workspace_root))
+
+    if proc.returncode != 0:
+        _error('setup-workspace.py --commercial failed.')
+        _info('Review the output above for details.')
+        sys.exit(4)
+
+
+def _resolve_repo_url(use_https: bool) -> str:
+    """Resolve the ai-frwk clone URL based on SSH availability."""
+    if use_https:
+        return AIFRWK_REPO_HTTPS
+    if _can_ssh_to_github():
+        return AIFRWK_REPO_SSH
+    _info('SSH not available, using HTTPS.')
+    return AIFRWK_REPO_HTTPS
+
+
+# ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
     """Entry point: orchestrate the bootstrap process."""
+    global _exit_success
+
     # --- Show logo -------------------------------------------------------------
     _show_logo()
 
-    # Determine invocation mode.
+    # --- Early commercial mode detection (before any prompts) -----------------
+    # Check if CWD is an OneDrive-synced directory with CRM ID and no .git/.
+    # This check fires ONLY for interactive/launcher invocations (no CLI args).
+    if _is_interactive():
+        early_config = {'crm_id': '', 'use_https': False, 'branch': 'main'}
+        is_commercial, inferred_crm = _detect_commercial_mode(early_config)
+        if is_commercial:
+            _info(f'Detected commercial workspace: {Path.cwd().name}')
+            _info(f'CRM ID: {inferred_crm}')
+            print()
+
+            use_https = False
+            branch = 'main'
+
+            # Minimal prerequisite check for commercial mode (only git needed).
+            _step('Checking prerequisites')
+            if not _check_command('git'):
+                _error('git not found in PATH.')
+                _info('Install Git and ensure it is added to PATH.')
+                sys.exit(1)
+            _ok('git')
+            _ok(f'python ({sys.executable})')
+
+            _commercial_setup(inferred_crm, branch, use_https)
+
+            _exit_success = True
+            return
+
+    # --- Standard flow (CLI args or interactive without commercial signals) ----
     if _is_interactive():
         config = _gather_interactive()
     else:
         config = _parse_args()
 
-    # Register exit pause for double-click launches.
+    # --- Check for commercial mode from CLI (explicit --branch/--https only) ---
+    is_commercial, inferred_crm = _detect_commercial_mode(config)
+
+    if is_commercial:
+        use_https: bool = config['use_https']
+        branch: str = config['branch']
+
+        # Minimal prerequisite check for commercial mode (only git needed).
+        _step('Checking prerequisites')
+        if not _check_command('git'):
+            _error('git not found in PATH.')
+            _info('Install Git and ensure it is added to PATH.')
+            sys.exit(1)
+        _ok('git')
+        _ok(f'python ({sys.executable})')
+
+        _commercial_setup(inferred_crm, branch, use_https)
+
+        _exit_success = True
+        return
+
+    # --- Standard (delivery) flow below ---------------------------------------
+
     # --- Validate CRM ID -----------------------------------------------------
     crm_id = config['crm_id']
     err = _validate_crm_id(crm_id)
@@ -537,7 +789,6 @@ def main() -> None:
         sys.exit(3)
 
     # --- Success --------------------------------------------------------------
-    global _exit_success
     _exit_success = True
     _unregister_cleanup()
     _step('Setup complete')

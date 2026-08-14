@@ -11,6 +11,9 @@
 :: Prerequisite: Python 3.11+ in PATH (Windows or WSL).
 ::
 
+:: Ensure CWD is the directory where this script lives.
+cd /d "%~dp0"
+
 echo.
 echo   AI Framework - Workspace Setup
 echo   ================================
