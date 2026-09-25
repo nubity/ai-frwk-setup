@@ -54,6 +54,38 @@ CLONE_DIR_NAME = 'ai-frwk-setup'
 VERSION = '1.1.0'
 CRM_ID_PATTERN = re.compile(r'\b(\d{19})\b')
 
+# --- JIRA role probe -------------------------------------------------------
+# The workspace layout (canonical delivery vs commercial) is role-driven: the
+# authoritative determinant is whether the resolved role is a technical
+# delivery role (see enumerations/role.py:nonTechnicalRoles). bootstrap.py must
+# choose the download path/layer BEFORE the framework (and its authoritative
+# resolver, _role_utils.resolveRoleFromJiraGroups) exists on disk. This probe
+# reproduces that resolver's two-call contract with the standard library only,
+# so bootstrap stays single-file and zero-dependency. It is used SOLELY to
+# choose the layer; setup-workspace.py still resolves and persists the
+# authoritative role. Any failure returns None (the caller degrades to the
+# directory-name heuristic).
+
+JIRA_BASE_URL = 'https://nubity.atlassian.net'
+
+# naifw-* JIRA group name -> role slug. Mirrors _role_utils.NAIFW_GROUP_TO_ROLE
+# and enumerations/role.py. Kept in sync manually; both are small and stable.
+NAIFW_GROUP_TO_ROLE = {
+    'naifw-am': 'account-manager',
+    'naifw-presales': 'presales',
+    'naifw-po': 'po',
+    'naifw-tl': 'tl',
+    'naifw-engineer': 'engineer',
+    'naifw-ops': 'operations',
+}
+
+NAIFW_PREFIX = 'naifw-'
+
+# Technical delivery roles use the canonical layout (framework inside the
+# workspace, git repo). Every other role uses the commercial layout. Mirrors
+# enumerations/role.py:technicalRoles / nonTechnicalRoles.
+TECHNICAL_ROLES = frozenset({'tl', 'engineer', 'operations'})
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -448,16 +480,104 @@ def _show_logo() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _jira_get(path: str) -> object | None:
+    """
+    Perform an authenticated GET against the JIRA REST API (stdlib only).
+
+    Uses HTTP Basic auth built from ATLASSIAN_USER_EMAIL and
+    ATLASSIAN_API_TOKEN, exactly as the framework's JIRA client does. Returns
+    the parsed JSON body, or None on any failure (missing credentials, network
+    error, non-2xx, malformed JSON). This is a best-effort probe: it never
+    raises to the caller.
+
+    :param path: The API path beginning with '/', e.g. '/rest/api/3/myself'.
+    :return: The parsed JSON (dict or list), or None on any failure.
+    """
+    import base64
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    email = os.environ.get('ATLASSIAN_USER_EMAIL', '')
+    token = os.environ.get('ATLASSIAN_API_TOKEN', '')
+    if not email or not token:
+        return None
+
+    credentials = base64.b64encode(f'{email}:{token}'.encode()).decode('ascii')
+    request = urllib.request.Request(
+        f'{JIRA_BASE_URL}{path}',
+        headers={
+            'Authorization': f'Basic {credentials}',
+            'Accept': 'application/json',
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return _json.loads(response.read().decode('utf-8'))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_role_from_jira() -> str | None:
+    """
+    Resolve the user's role from naifw-* JIRA group membership (best-effort).
+
+    Reproduces _role_utils.resolveRoleFromJiraGroups with the standard library
+    only: resolves the accountId via /rest/api/3/myself, then reads
+    /rest/api/3/user/groups and returns the role slug for the first naifw-*
+    group found. Returns None when credentials are absent, the API is
+    unreachable, the responses are malformed, or the user has no naifw-* group.
+
+    The result is used ONLY to choose the workspace layer. It is never
+    persisted here - setup-workspace.py remains the authoritative resolver.
+
+    :return: The role slug (e.g. 'engineer', 'account-manager') or None.
+    """
+    myself = _jira_get('/rest/api/3/myself')
+    if not isinstance(myself, dict):
+        return None
+    account_id = myself.get('accountId', '')
+    if not account_id:
+        return None
+
+    groups = _jira_get(f'/rest/api/3/user/groups?accountId={account_id}')
+    if not isinstance(groups, list):
+        return None
+
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        name = group.get('name', '')
+        if name.startswith(NAIFW_PREFIX) and name in NAIFW_GROUP_TO_ROLE:
+            return NAIFW_GROUP_TO_ROLE[name]
+
+    return None
+
+
 def _detect_commercial_mode(config: dict) -> tuple[bool, str]:
     """
     Determine if the bootstrap was invoked from a commercial workspace.
 
-    Commercial mode is detected when ALL conditions hold:
-    1. No CRM ID was explicitly passed as a positional argument.
-    2. The current working directory name matches the OneDrive-synced directory
-       naming convention: "Nubity Document Site - <19-digit CRM ID>".
-    3. No local .kiro/config.json exists (delivery workspaces always have this
-       after setup; its presence is the canonical delivery signal).
+    The workspace layer is role-driven: technical delivery roles (tl, engineer,
+    operations) always use the canonical layout, and non-technical roles use the
+    commercial layout (see enumerations/role.py). The user's role is the
+    authoritative signal; the directory-name convention is only a fallback for
+    when the role cannot be resolved (missing JIRA credentials, offline, or the
+    user has no naifw-* group yet).
+
+    Decision order:
+    1. An explicit positional CRM ID forces the canonical (delivery) flow.
+    2. A local .kiro/config.json marks an already-set-up canonical workspace.
+    3. If the JIRA role probe resolves a role, it is authoritative:
+       - a technical role forces canonical (NOT commercial), even when invoked
+         from inside an OneDrive-synced directory - a technical user must never
+         be set up in place inside the shared directory;
+       - a non-technical role selects commercial, provided a CRM ID is
+         resolvable from the directory name (the commercial layer requires it).
+    4. When the role cannot be resolved, fall back to the directory-name
+       heuristic: an "Nubity Document Site - <CRM ID>" directory without a local
+       .kiro/config.json is treated as commercial.
 
     Note: .git/ is NOT used as a disqualifier because old commercial setups
     may have a stale .git/ from the framework clone that previously lived
@@ -466,26 +586,40 @@ def _detect_commercial_mode(config: dict) -> tuple[bool, str]:
     :param config: Parsed CLI arguments or interactive config dict.
     :return: Tuple of (is_commercial, crm_id). crm_id is empty when not commercial.
     """
+    # (1) Explicit positional CRM ID -> canonical delivery flow.
     if config['crm_id']:
         return False, ''
 
     cwd = Path.cwd()
 
-    # Primary signal: directory name matches OneDrive convention.
-    if not cwd.name.startswith('Nubity Document Site - '):
-        return False, ''
-
-    # Extract CRM ID from directory name.
-    match = CRM_ID_PATTERN.search(cwd.name)
-    if not match:
-        return False, ''
-
-    # Delivery exclusion: local .kiro/config.json means this is a canonical
-    # delivery workspace that was set up on top of the OneDrive directory.
+    # (2) A local .kiro/config.json is the canonical delivery signal.
     if (cwd / '.kiro' / 'config.json').is_file():
         return False, ''
 
-    return True, match.group(1)
+    # Resolve the CRM ID the commercial layer would need, from the directory
+    # name. Its presence gates commercial mode regardless of how the role is
+    # resolved, because the commercial setup keys the project map by CRM ID.
+    match = CRM_ID_PATTERN.search(cwd.name)
+    dir_is_onedrive = cwd.name.startswith('Nubity Document Site - ') and bool(match)
+    crm_id = match.group(1) if match else ''
+
+    # (3) Role-driven decision (authoritative when the probe succeeds).
+    role = _probe_role_from_jira()
+    if role is not None:
+        if role in TECHNICAL_ROLES:
+            # Technical roles never use the commercial layout, even when invoked
+            # from inside the OneDrive-synced directory.
+            return False, ''
+        # Non-technical role: commercial layout, but only if a CRM ID is
+        # available (it comes from the OneDrive directory name).
+        if dir_is_onedrive:
+            return True, crm_id
+        return False, ''
+
+    # (4) Role unresolved -> fall back to the directory-name heuristic.
+    if dir_is_onedrive:
+        return True, crm_id
+    return False, ''
 
 
 def _commercial_setup(crm_id: str, branch: str, use_https: bool) -> None:
